@@ -1,0 +1,13 @@
+package: github.com/dbenque/mw-injector
+import:
+- package: github.com/golang/glog
+- package: github.com/spf13/pflag
+  version: ^1.0.0
+- package: k8s.io/client-go
+  version: ^4.0.0
+  subpackages:
+  - kubernetes
+  - kubernetes/informers
+  - kubernetes/informers/core/v1
+  - rest
+  - tools/clientcmd
