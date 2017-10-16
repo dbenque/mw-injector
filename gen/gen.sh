@@ -1,1 +1,3 @@
 $GOPATH/bin/deepcopy-gen -i github.com/dbenque/mw-injector/pkg/api/mwinjector/v1 --output-file-base deepcopy_generated.go --go-header-file="$GOPATH/src/github.com/dbenque/mw-injector/hack/boilerplate.go.txt" --logtostderr
+$GOPATH/bin/lister-gen -i github.com/dbenque/mw-injector/pkg/api/mwinjector/v1 --output-package github.com/dbenque/mw-injector/pkg/client/listers/ --go-header-file="$GOPATH/src/github.com/dbenque/mw-injector/hack/boilerplate.go.txt" --logtostderr
+$GOPATH/bin/informer-gen -i github.com/dbenque/mw-injector/pkg/api/mwinjector/v1 --output-package github.com/dbenque/mw-injector/pkg/client/informers/ --go-header-file="$GOPATH/src/github.com/dbenque/mw-injector/hack/boilerplate.go.txt" --logtostderr
