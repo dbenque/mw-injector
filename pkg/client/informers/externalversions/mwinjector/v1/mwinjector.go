@@ -7,12 +7,12 @@ package v1
 import (
 	mwinjector_v1 "github.com/dbenque/mw-injector/pkg/api/mwinjector/v1"
 	internalinterfaces "github.com/dbenque/mw-injector/pkg/client/informers/externalversions/internalinterfaces"
+	v1 "github.com/dbenque/mw-injector/pkg/client/listers/mwinjector/v1"
+	versioned "github.com/dbenque/mw-injector/pkg/client/versioned"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
-	v1 "k8s.io/kubernetes/pkg/client/listers/mwinjector/v1"
 	time "time"
 )
 
@@ -30,7 +30,7 @@ type mWInjectorInformer struct {
 // NewMWInjectorInformer constructs a new informer for MWInjector type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
-func NewMWInjectorInformer(client clientset.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
+func NewMWInjectorInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
 	return cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListFunc: func(options meta_v1.ListOptions) (runtime.Object, error) {
@@ -46,7 +46,7 @@ func NewMWInjectorInformer(client clientset.Interface, namespace string, resyncP
 	)
 }
 
-func defaultMWInjectorInformer(client clientset.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
+func defaultMWInjectorInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
 	return NewMWInjectorInformer(client, meta_v1.NamespaceAll, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 }
 

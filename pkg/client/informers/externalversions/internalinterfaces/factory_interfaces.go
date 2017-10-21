@@ -5,13 +5,13 @@
 package internalinterfaces
 
 import (
+	versioned "github.com/dbenque/mw-injector/pkg/client/versioned"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	cache "k8s.io/client-go/tools/cache"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
 	time "time"
 )
 
-type NewInformerFunc func(clientset.Interface, time.Duration) cache.SharedIndexInformer
+type NewInformerFunc func(versioned.Interface, time.Duration) cache.SharedIndexInformer
 
 // SharedInformerFactory a small interface to allow for adding an informer without an import cycle
 type SharedInformerFactory interface {

@@ -7,17 +7,17 @@ package externalversions
 import (
 	internalinterfaces "github.com/dbenque/mw-injector/pkg/client/informers/externalversions/internalinterfaces"
 	mwinjector "github.com/dbenque/mw-injector/pkg/client/informers/externalversions/mwinjector"
+	versioned "github.com/dbenque/mw-injector/pkg/client/versioned"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	cache "k8s.io/client-go/tools/cache"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/clientset"
 	reflect "reflect"
 	sync "sync"
 	time "time"
 )
 
 type sharedInformerFactory struct {
-	client        clientset.Interface
+	client        versioned.Interface
 	lock          sync.Mutex
 	defaultResync time.Duration
 
@@ -28,7 +28,7 @@ type sharedInformerFactory struct {
 }
 
 // NewSharedInformerFactory constructs a new instance of sharedInformerFactory
-func NewSharedInformerFactory(client clientset.Interface, defaultResync time.Duration) SharedInformerFactory {
+func NewSharedInformerFactory(client versioned.Interface, defaultResync time.Duration) SharedInformerFactory {
 	return &sharedInformerFactory{
 		client:           client,
 		defaultResync:    defaultResync,

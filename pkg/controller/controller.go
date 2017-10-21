@@ -10,11 +10,8 @@ import (
 
 	"github.com/golang/glog"
 
-	batch "k8s.io/api/batch/v1"
-	batchv2 "k8s.io/api/batch/v2alpha1"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 
@@ -22,10 +19,9 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
-	namespacelisters "k8s.io/client-go/listers/batch/v1"
+	namespacelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/client-go/tools/reference"
 	"k8s.io/client-go/util/workqueue"
 
 	mwiapi "github.com/dbenque/mw-injector/pkg/api/mwinjector/v1"
@@ -50,9 +46,7 @@ type MWInjectorController struct {
 	MWInjectorSynced cache.InformerSynced
 
 	NamespaceLister namespacelisters.NamespaceLister
-	NamespaceSynced cache.InformerSynced // returns true if job has been synced. Added as member for testing
-
-	NamespaceControl NamespaceControlInterface
+	NamespaceSynced cache.InformerSynced // returns true if Namespaces has been synced. Added as member for testing
 
 	updateHandler func(*mwiapi.MWInjector) error // callback to upate MWInjector. Added as member for testing
 
@@ -75,7 +69,7 @@ func NewMWInjectorController(
 	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: v1core.New(kubeClient.Core().RESTClient()).Events("")})
 
 	namespaceInformer := kubeInformerFactory.Core().V1().Namespaces()
-	mwinjectorInformer := mwinjectorInformerFactory.MWInjector().V1().MWInjectors()
+	mwinjectorInformer := mwinjectorInformerFactory.Mwinjector().V1().MWInjectors()
 
 	wc := &MWInjectorController{
 		MWInjectorClient: mwinjectorClient,
@@ -85,7 +79,7 @@ func NewMWInjectorController(
 		NamespaceLister:  namespaceInformer.Lister(),
 		NamespaceSynced:  namespaceInformer.Informer().HasSynced,
 
-		queueNamespaces workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "mwinjector"),
+		queue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "mwinjector"),
 		config: MWInjectorControllerConfig{
 			RemoveIvalidMWInjector: true,
 			NumberOfThreads:        1,
@@ -102,19 +96,16 @@ func NewMWInjectorController(
 	)
 
 	namespaceInformer.Informer().AddEventHandler(
-		cache.Namespaces{
-			AddFunc:    wc.onAddJob,
-			UpdateFunc: wc.onUpdateJob,
-			DeleteFunc: wc.onDeleteJob,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    wc.onAddNamespace,
+			UpdateFunc: wc.onUpdateNamespace,
+			DeleteFunc: wc.onDeleteNamespace,
 		},
 	)
-	wc.NamespaceControl = &MWInjectorNamespaceControl{kubeClient, wc.Recorder}
 	wc.updateHandler = wc.updateMWInjector
 
 	return wc
 }
-
-TO CONTINUE
 
 // Run simply runs the controller. Assuming Informers are already running: via factories
 func (w *MWInjectorController) Run(ctx context.Context) error {
@@ -182,6 +173,7 @@ func (w *MWInjectorController) sync(key string) error {
 		glog.Errorf("unable to get MWInjector %s/%s: %v. Maybe deleted", namespace, name, err)
 		return nil
 	}
+
 	if !mwiapi.IsMWInjectorDefaulted(sharedMWInjector) {
 		defaultedMWInjector := mwiapi.DefaultMWInjector(sharedMWInjector)
 		if err := w.updateHandler(defaultedMWInjector); err != nil {
@@ -194,7 +186,7 @@ func (w *MWInjectorController) sync(key string) error {
 
 	// Validation. We always revalidate MWInjector since any update must be re-checked.
 	if errs := mwiapi.ValidateMWInjector(sharedMWInjector); errs != nil && len(errs) > 0 {
-		glog.Errorf("MWInjectorController.sync Worfklow %s/%s not valid: %v", namespace, name, errs)
+		glog.Errorf("MWInjectorController.sync MWInjector %s/%s not valid: %v", namespace, name, errs)
 		if w.config.RemoveIvalidMWInjector {
 			glog.Errorf("Invalid mwinjector %s/%s is going to be removed", namespace, name)
 			if err := w.deleteMWInjector(namespace, name); err != nil {
@@ -212,43 +204,7 @@ func (w *MWInjectorController) sync(key string) error {
 
 	mwinjector := sharedMWInjector.DeepCopy()
 
-	// Init status.StartTime
-	if mwinjector.Status.StartTime == nil {
-		mwinjector.Status.Statuses = make([]mwiapi.MWInjectorStepStatus, 0)
-		now := metav1.Now()
-		mwinjector.Status.StartTime = &now
-		if err := w.updateHandler(mwinjector); err != nil {
-			glog.Errorf("mwinjector %s/%s: unable init startTime: %v", namespace, name, err)
-			return err
-		}
-		glog.V(4).Infof("mwinjector %s/%s: startTime updated", namespace, name)
-		return nil
-	}
-
-	if pastActiveDeadline(mwinjector, startTime) {
-		now := metav1.Now()
-		mwinjector.Status.Conditions = append(mwinjector.Status.Conditions, newDeadlineExceededCondition())
-		mwinjector.Status.CompletionTime = &now
-		if err := w.updateHandler(mwinjector); err != nil {
-			glog.Errorf("mwinjector %s/%s unable to set DeadlineExceeded: %v", mwinjector.ObjectMeta.Namespace, mwinjector.ObjectMeta.Name, err)
-			return fmt.Errorf("unable to set DeadlineExceeded for MWInjector %s/%s: %v", mwinjector.ObjectMeta.Namespace, mwinjector.ObjectMeta.Name, err)
-		}
-		if err := w.deleteMWInjectorJobs(mwinjector); err != nil {
-			glog.Errorf("mwinjector %s/%s: unable to cleanup jobs: %v", mwinjector.ObjectMeta.Namespace, mwinjector.ObjectMeta.Name, err)
-			return fmt.Errorf("mwinjector %s/%s: unable to cleanup jobs: %v", mwinjector.ObjectMeta.Namespace, mwinjector.ObjectMeta.Name, err)
-		}
-		return nil
-	}
-
 	return w.manageMWInjector(mwinjector)
-}
-
-func newDeadlineExceededCondition() mwiapi.MWInjectorCondition {
-	return newCondition(mwiapi.MWInjectorFailed, "DeadlineExceeded", "MWInjector was active longer than specified deadline")
-}
-
-func newCompletedCondition() mwiapi.MWInjectorCondition {
-	return newCondition(mwiapi.MWInjectorComplete, "", "")
 }
 
 func newCondition(conditionType mwiapi.MWInjectorConditionType, reason, message string) mwiapi.MWInjectorCondition {
@@ -289,10 +245,6 @@ func (w *MWInjectorController) onUpdateMWInjector(oldObj, newObj interface{}) {
 		glog.Errorf("Expected mwinjector object. Got: %+v", newObj)
 		return
 	}
-	if IsMWInjectorFinished(mwinjector) {
-		glog.Warningf("Update event received on complete MWInjector: %s/%s", mwinjector.Namespace, mwinjector.Name)
-		return
-	}
 	w.enqueue(mwinjector)
 }
 
@@ -306,14 +258,14 @@ func (w *MWInjectorController) onDeleteMWInjector(obj interface{}) {
 }
 
 func (w *MWInjectorController) updateMWInjector(wfl *mwiapi.MWInjector) error {
-	if _, err := w.MWInjectorClient.MWInjectorV1().MWInjectors(wfl.Namespace).Update(wfl); err != nil {
+	if _, err := w.MWInjectorClient.MwinjectorV1().MWInjectors(wfl.Namespace).Update(wfl); err != nil {
 		glog.V(6).Infof("MWInjector %s/%s updated", wfl.Namespace, wfl.Name)
 	}
 	return nil
 }
 
 func (w *MWInjectorController) deleteMWInjector(namespace, name string) error {
-	if err := w.MWInjectorClient.MWInjectorV1().MWInjectors(namespace).Delete(name, nil); err != nil {
+	if err := w.MWInjectorClient.MwinjectorV1().MWInjectors(namespace).Delete(name, nil); err != nil {
 		return fmt.Errorf("unable to delete MWInjector %s/%s: %v", namespace, name, err)
 	}
 
@@ -321,11 +273,11 @@ func (w *MWInjectorController) deleteMWInjector(namespace, name string) error {
 	return nil
 }
 
-func (w *MWInjectorController) onAddJob(obj interface{}) {
-	job := obj.(*batch.Job)
-	mwinjectors, err := w.getMWInjectorsFromJob(job)
+func (w *MWInjectorController) onAddNamespace(obj interface{}) {
+	ns := obj.(*apiv1.Namespace)
+	mwinjectors, err := w.getMWInjectorsFromNamespace(ns)
 	if err != nil {
-		glog.Errorf("unable to get mwinjectors from job %s/%s: %v", job.Namespace, job.Name, err)
+		glog.Errorf("unable to get mwinjectors from namespace %s: %v", ns.Name, err)
 		return
 	}
 	for i := range mwinjectors {
@@ -333,212 +285,67 @@ func (w *MWInjectorController) onAddJob(obj interface{}) {
 	}
 }
 
-func (w *MWInjectorController) onUpdateJob(oldObj, newObj interface{}) {
-	oldJob := oldObj.(*batch.Job)
-	newJob := newObj.(*batch.Job)
-	if oldJob.ResourceVersion == newJob.ResourceVersion { // Since periodic resync will send update events for all known jobs.
+func (w *MWInjectorController) onUpdateNamespace(oldObj, newObj interface{}) {
+	oldNs := oldObj.(*apiv1.Namespace)
+	newNs := newObj.(*apiv1.Namespace)
+	if oldNs.ResourceVersion == newNs.ResourceVersion { // Since periodic resync will send update events for all known namespaces.
 		return
 	}
-	glog.V(6).Infof("onUpdateJob old=%v, cur=%v ", oldJob.Name, newJob.Name)
-	mwinjectors, err := w.getMWInjectorsFromJob(newJob)
+	glog.V(6).Infof("onUpdateNamespace old=%v, cur=%v ", oldNs.Name, newNs.Name)
+	mwinjectors, err := w.getMWInjectorsFromNamespace(newNs)
 	if err != nil {
-		glog.Errorf("MWInjectorController.onUpdateJob cannot get mwinjectors for job %s/%s: %v", newJob.Namespace, newJob.Name, err)
+		glog.Errorf("MWInjectorController.onUpdateNamespace cannot get mwinjectors for namespace %s: %v", newNs.Name, newNs.Name, err)
 		return
 	}
 	for i := range mwinjectors {
 		w.enqueue(mwinjectors[i])
 	}
-
-	// TODO: in case of relabelling ?
-	// TODO: in case of labelSelector relabelling?
 }
 
-func (w *MWInjectorController) onDeleteJob(obj interface{}) {
-	job, ok := obj.(*batch.Job)
-	glog.V(6).Infof("onDeleteJob old=%v", job.Name)
+func (w *MWInjectorController) onDeleteNamespace(obj interface{}) {
+	ns, ok := obj.(*apiv1.Namespace)
+	glog.V(6).Infof("onDeleteNamespace old=%v", ns.Name)
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
 			glog.Errorf("Couldn't get object from tombstone %+v", obj)
 			return
 		}
-		job, ok = tombstone.Obj.(*batch.Job)
+		ns, ok = tombstone.Obj.(*apiv1.Namespace)
 		if !ok {
-			glog.Errorf("Tombstone contained object that is not a job %+v", obj)
+			glog.Errorf("Tombstone contained object that is not a ns %+v", obj)
 			return
 		}
 	}
-	mwinjectors, err := w.getMWInjectorsFromJob(job)
+	mwinjectors, err := w.getMWInjectorsFromNamespace(ns)
 	if err != nil {
-		glog.Errorf("MWInjectorController.onDeleteJob: %v", err)
+		glog.Errorf("MWInjectorController.onDeleteNamespace: %v", err)
 		return
 	}
 	for i := range mwinjectors {
-		//ww.expectations.DeleteiontObjserved(keyFunc(mwinjectors[i])
 		w.enqueue(mwinjectors[i])
 	}
 }
 
-func (w *MWInjectorController) getMWInjectorsFromJob(job *batch.Job) ([]*mwiapi.MWInjector, error) {
+func (w *MWInjectorController) getMWInjectorsFromNamespace(ns *apiv1.Namespace) ([]*mwiapi.MWInjector, error) {
 	mwinjectors := []*mwiapi.MWInjector{}
-	if len(job.Labels) == 0 {
-		return mwinjectors, fmt.Errorf("no mwinjectors found for job. Job %s/%s has no labels", job.Namespace, job.Name)
+	if len(ns.Labels) == 0 {
+		return mwinjectors, fmt.Errorf("no mwinjectors found for namespace. Namespace %s has no labels", ns.Name)
 	}
 	mwinjectorList, err := w.MWInjectorLister.List(labels.Everything())
 	if err != nil {
-		return mwinjectors, fmt.Errorf("no mwinjectors found for job. Job %s/%s. Cannot list mwinjectors: %v", job.Namespace, job.Name, err)
+		return mwinjectors, fmt.Errorf("no mwinjectors found for namespace. Namespace %s. Cannot list mwinjectors: %v", ns.Name, err)
 	}
-	//mwinjectorStore.List()
+
 	for i := range mwinjectorList {
 		mwinjector := mwinjectorList[i]
-		if mwinjector.Namespace != job.Namespace {
-			continue
-		}
-		if labels.SelectorFromSet(mwinjector.Spec.Selector.MatchLabels).Matches(labels.Set(job.Labels)) {
+		if labels.SelectorFromSet(mwinjector.Spec.NamespaceSelector.MatchLabels).Matches(labels.Set(ns.Labels)) {
 			mwinjectors = append(mwinjectors, mwinjector)
 		}
 	}
 	return mwinjectors, nil
 }
 
-func pastActiveDeadline(mwinjector *mwiapi.MWInjector, now time.Time) bool {
-	if mwinjector.Spec.ActiveDeadlineSeconds == nil || mwinjector.Status.StartTime == nil {
-		return false
-	}
-	start := mwinjector.Status.StartTime.Time
-	duration := now.Sub(start)
-	allowedDuration := time.Duration(*mwinjector.Spec.ActiveDeadlineSeconds) * time.Second
-	return duration >= allowedDuration
-}
-
-func (w *MWInjectorController) manageMWInjector(mwinjector *mwiapi.MWInjector) error {
-	mwinjectorToBeUpdated := false
-	mwinjectorComplete := true
-	for i := range mwinjector.Spec.Steps {
-		stepName := mwinjector.Spec.Steps[i].Name
-		stepStatus := mwiapi.GetStepStatusByName(mwinjector, stepName)
-		if stepStatus != nil && stepStatus.Complete {
-			continue
-		}
-
-		mwinjectorComplete = false
-		switch {
-		case mwinjector.Spec.Steps[i].JobTemplate != nil: // Job step
-			if w.manageMWInjectorJobStep(mwinjector, stepName, &(mwinjector.Spec.Steps[i])) {
-				mwinjectorToBeUpdated = true
-				break
-			}
-		case mwinjector.Spec.Steps[i].ExternalRef != nil: // TODO handle: external object reference
-			if w.manageMWInjectorReferenceStep(mwinjector, stepName, &(mwinjector.Spec.Steps[i])) {
-				mwinjectorToBeUpdated = true
-				break
-			}
-		}
-	}
-	if mwinjectorComplete {
-		now := metav1.Now()
-		mwinjector.Status.Conditions = append(mwinjector.Status.Conditions, newCompletedCondition())
-		mwinjector.Status.CompletionTime = &now
-		glog.Infof("MWInjector %s/%s complete.", mwinjector.Namespace, mwinjector.Name)
-		mwinjectorToBeUpdated = true
-	}
-
-	if mwinjectorToBeUpdated {
-		if err := w.updateHandler(mwinjector); err != nil {
-			utilruntime.HandleError(err)
-			w.enqueue(mwinjector)
-			return err
-		}
-	}
+func (w *MWInjectorController) manageMWInjector(mwi *mwiapi.MWInjector) error {
 	return nil
-}
-
-func (w *MWInjectorController) manageMWInjectorJobStep(mwinjector *mwiapi.MWInjector, stepName string, step *mwiapi.MWInjectorStep) bool {
-	mwinjectorUpdated := false
-	for _, dependencyName := range step.Dependencies {
-		dependencyStatus := GetStepStatusByName(mwinjector, dependencyName)
-		if dependencyStatus == nil || !dependencyStatus.Complete {
-			glog.V(4).Infof("MWInjector %s/%s: dependecy %q not satisfied for %q", mwinjector.Namespace, mwinjector.Name, dependencyName, stepName)
-			return mwinjectorUpdated
-		}
-	}
-	glog.V(6).Infof("MWInjector %s/%s: All dependecy satisfied for %q", mwinjector.Namespace, mwinjector.Name, stepName)
-	jobs, err := w.retrieveJobsStep(mwinjector, step.JobTemplate, stepName)
-	if err != nil {
-		glog.Errorf("unable to retrieve step jobs for MWInjector %s/%s, step:%q: %v", mwinjector.Namespace, mwinjector.Name, stepName, err)
-		w.enqueue(mwinjector)
-		return mwinjectorUpdated
-	}
-	switch len(jobs) {
-	case 0: // create job
-		_, err := w.NamespaceControl.CreateJob(mwinjector.Namespace, step.JobTemplate, mwinjector, stepName)
-		if err != nil {
-			glog.Errorf("Couldn't create job: %v : %v", err, step.JobTemplate)
-			w.enqueue(mwinjector)
-			defer utilruntime.HandleError(err)
-			return mwinjectorUpdated
-		}
-		//w.expectations.CreationObserved(key)
-		mwinjectorUpdated = true
-		glog.V(4).Infof("Job created for step %q", stepName)
-	case 1: // update status
-		job := jobs[0]
-		reference, err := reference.GetReference(scheme.Scheme, job)
-		if err != nil || reference == nil {
-			glog.Errorf("Unable to get reference from %v: %v", job.Name, err)
-			return false
-		}
-		jobFinished := IsJobFinished(job)
-		stepStatus := GetStepStatusByName(mwinjector, stepName)
-		if stepStatus == nil {
-			mwinjector.Status.Statuses = append(mwinjector.Status.Statuses, mwiapi.MWInjectorStepStatus{
-				Name:      stepName,
-				Complete:  jobFinished,
-				Reference: *reference})
-			mwinjectorUpdated = true
-		}
-		if jobFinished {
-			stepStatus.Complete = jobFinished
-			glog.V(4).Infof("MWInjector %s/%s Job finished for step %q", mwinjector.Namespace, mwinjector.Name, stepName)
-			mwinjectorUpdated = true
-		}
-	default: // reconciliate
-		glog.Errorf("manageMWInjectorJobStep %v too many jobs reported... Need reconciliation", mwinjector.Name)
-		return false
-	}
-	return mwinjectorUpdated
-}
-
-func (w *MWInjectorController) manageMWInjectorReferenceStep(mwinjector *mwiapi.MWInjector, stepName string, step *mwiapi.MWInjectorStep) bool {
-	return true
-}
-
-func (w *MWInjectorController) retrieveJobsStep(mwinjector *mwiapi.MWInjector, template *batchv2.JobTemplateSpec, stepName string) ([]*batch.Job, error) {
-	jobSelector := createMWInjectorJobLabelSelector(mwinjector, template, stepName)
-	jobs, err := w.NamespaceLister.Jobs(mwinjector.Namespace).List(jobSelector)
-	if err != nil {
-		return jobs, err
-	}
-	return jobs, nil
-}
-
-func (w *MWInjectorController) deleteMWInjectorJobs(mwinjector *mwiapi.MWInjector) error {
-	glog.V(6).Infof("deleting all jobs for mwinjector %s/%s", mwinjector.Namespace, mwinjector.Name)
-	jobsSelector := inferrMWInjectorLabelSelectorForJobs(mwinjector)
-	jobs, err := w.NamespaceLister.Jobs(mwinjector.Namespace).List(jobsSelector)
-	if err != nil {
-		return fmt.Errorf("mwinjector %s/%s, unable to retrieve jobs to remove: %v", mwinjector.Namespace, mwinjector.Name, err)
-	}
-	errs := []error{}
-	for i := range jobs {
-		jobToBeRemoved := jobs[i].DeepCopy()
-		if IsJobFinished(jobToBeRemoved) { // don't remove already finished job
-			glog.V(4).Info("skipping job %s since finished", jobToBeRemoved.Name)
-			continue
-		}
-		if err := w.NamespaceControl.DeleteJob(jobToBeRemoved.Namespace, jobToBeRemoved.Name, jobToBeRemoved); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return utilerrors.NewAggregate(errs)
 }
